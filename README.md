@@ -129,7 +129,7 @@ L'interface propose deux modes de sélection des prédicteurs :
 | `relevance` | Pertinence de l'article (1-5) |
 | `confidence` | Confiance de l'extraction (1-5) |
 | `source_text` | Passage exact de l'abstract cité |
-| `note` | Note complémentaire du LLM |
+| `note` | Le passage exact de l’abstract à partir duquel l’effect size est extrait, ou, à défaut, une note complémentaire fournie par le LLM.|
 
 ### Export Excel — 4 onglets
 
