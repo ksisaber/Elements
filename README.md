@@ -171,7 +171,7 @@ Les effect sizes dans les abstracts sont exprimés de façons très hétérogèn
 
 ## APIs utilisées
 
-| API | Authentification | Coût |
+| API | Authentification |
 |---|---|---|
-| [Anthropic Claude](https://docs.anthropic.com) | Clé API (`sk-ant-...`) | Payant (≈ $0.01–0.05 par projet selon paramètres) |
-| [OpenAlex](https://docs.openalex.org) | Email dans `mailto` (optionnel, améliore le rate limit) | Gratuit |
+| [Anthropic Claude](https://docs.anthropic.com) | Clé API (`sk-ant-...`) |
+| [OpenAlex](https://docs.openalex.org) | Email dans `mailto` (optionnel, améliore le rate limit) |
