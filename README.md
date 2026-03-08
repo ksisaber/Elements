@@ -48,7 +48,7 @@ Titre + Description du projet + Groupe ou Groupes bénéficiaires du projet + ta
 | Fichier | Description |
 |---|---|
 | `elements_impact_pipeline.ipynb` | Notebook Jupyter — pipeline complet, 1 cellule à modifier |
-| `app.py` | Interface Streamlit — mode LLM automatique + mode manuel |
+| `app_final3.py` | Interface Streamlit — mode LLM automatique + mode manuel |
 | `articles_dataset.xlsx` | Fichier de référence — onglet `Predictors` requis |
 
 ---
@@ -93,7 +93,7 @@ Exécuter toutes les cellules dans l'ordre. L'export Excel est généré automat
 ### Interface Streamlit
 
 ```bash
-streamlit run app.py
+streamlit run app_final3.py
 ```
 
 > `articles_dataset.xlsx` doit être dans le même dossier que `app.py`.
