@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import time
 import datetime
 import requests
@@ -69,7 +70,11 @@ if "active_history_idx" not in st.session_state:
 if "selected_preds" not in st.session_state:
     st.session_state.selected_preds = set()
 
-# Helpers claude
+# ── Constantes ─────────────────────────────────────────────────────────────────
+OPENALEX_FETCH   = 20   # articles récupérés par requête (top N par requête avant pool)
+TOP_PER_QUERY    = 5    # on garde les 5 meilleurs par requête pour constituer le pool LLM
+
+# ── Helpers Claude ─────────────────────────────────────────────────────────────
 
 def call_claude(prompt: str, system: str = "", max_tokens: int = 2000, api_key: str = "") -> str:
     resp = requests.post(
@@ -117,7 +122,7 @@ def load_predictors(file_path: str) -> tuple[pd.DataFrame, str]:
     prompt_str = "\n".join(f"- [{r.domain_fr}] {r.predictor_en}" for _, r in df.iterrows())
     return df, prompt_str
 
-# PIPELINE STEPS
+# ── PIPELINE STEPS ─────────────────────────────────────────────────────────────
 
 def step1_select_predictors(project, predictors_prompt, top_n, api_key):
     resp = call_claude(
@@ -145,27 +150,130 @@ Sélectionne les {top_n} prédicteurs les plus susceptibles d\'être impactés.
     return sorted(parse_json(resp), key=lambda x: x.get("relevance_score", 0), reverse=True)
 
 
-def step2_build_query(pred_name, project, api_key):
-    return call_claude(
-        prompt=f"""Generate a short academic search query (4-6 words, ENGLISH ONLY) to find
-meta-analyses or RCTs measuring the effect size of interventions on: {pred_name}.
-The query MUST include the words 'effect size' or 'meta-analysis'.
-Respond with ONLY the query, no quotes, no punctuation, no explanation.""",
-        max_tokens=30, api_key=api_key
-    ).strip().strip('"').strip("'")
+def _unique_preserve_order(lst):
+    """Déduplique une liste en préservant l'ordre."""
+    seen = set()
+    return [x for x in lst if not (x in seen or seen.add(x))]
 
 
-def step2_search_openalex(query, n, min_citations, email):
+def step2_build_queries(pred_name, project):
+    """
+    Génère jusqu'à 10 requêtes déterministes.
+
+    Si project["search_context"] est renseigné (ex: "parenting support"),
+    ces termes sont injectés directement dans toutes les requêtes — ils
+    remplacent avantageusement un anchor extrait automatiquement car ils
+    sont choisis par l'utilisateur et correspondent à des termes académiques réels.
+
+    Sans search_context, les requêtes restent génériques (prédicteur seul +
+    groupe + tags), ce qui garantit un bon recall sur les prédicteurs peu
+    couverts dans un domaine spécifique.
+
+    Groupe 1 (Q1-Q5) : avec meta-analysis / systematic review
+      → ciblent les méta-analyses avec effect sizes explicites
+    Groupe 2 (Q6-Q10) : sans
+      → élargissent vers études primaires, RCTs, interventions
+    """
+    import re as _re
+
+    def tokenize(text):
+        stopwords = {
+            "a","an","the","of","in","for","on","with","to","and","or","at",
+            "by","as","is","are","was","were","be","been","being","have","has",
+            "had","do","does","did","will","would","could","should","may","might",
+            "its","it","this","that","these","those","their","our","your","his","her",
+            "un","une","le","la","les","de","du","des","en","et","ou","au","aux",
+            "pour","par","sur","dans","avec","qui","que","dont","center","support",
+            "program","programme","project","service","based","early","young",
+        }
+        words = _re.findall(r"[a-zA-Zéèêàùîôûç]{3,}", text.lower())
+        return [w for w in words if w not in stopwords]
+
+    pred    = tokenize(pred_name)
+    ctx     = tokenize(project.get("title", ""))
+    desc    = tokenize(project.get("description", ""))[:8]
+    group   = tokenize(project.get("target_group", ""))
+    tags    = tokenize(" ".join(project.get("tags", [])))
+
+    # Contexte de recherche saisi par l'utilisateur (ex: "parenting support")
+    # Directement utilisable dans les requêtes — termes académiques réels
+    search_ctx_raw   = project.get("search_context", "").strip()
+    search_ctx_terms = tokenize(search_ctx_raw) if search_ctx_raw else []
+    search_ctx       = " ".join(search_ctx_terms[:3])  # max 3 termes
+
+    queries = []
+
+    # ── Groupe 1 : avec meta-analysis / systematic review ─────────────────────
+
+    # Q1 : prédicteur seul + meta-analysis (requête de base, recall maximal)
+    if pred:
+        queries.append(" ".join(pred[:4]) + " meta-analysis")
+
+    # Q2 : prédicteur + groupe cible + meta-analysis
+    if pred and group:
+        queries.append(" ".join(pred[:3] + group[:2]) + " meta-analysis")
+
+    # Q3 : prédicteur + tags + meta-analysis
+    if pred and tags:
+        queries.append(" ".join(pred[:3] + tags[:2]) + " meta-analysis")
+
+    # Q4 : prédicteur + contexte titre + systematic review
+    if pred and ctx:
+        queries.append(" ".join(pred[:3] + ctx[:2]) + " systematic review")
+
+    # Q5 : prédicteur + wellbeing + systematic review (ancrage SWB Margolis)
+    if pred:
+        queries.append(" ".join(pred[:3]) + " wellbeing systematic review")
+
+    # ── Groupe 2 : sans meta-analysis — avec search_context si disponible ─────
+
+    # Q6 : prédicteur + search_context + wellbeing  (ou groupe si pas de contexte)
+    if pred and search_ctx:
+        queries.append(" ".join(pred[:3]) + f" {search_ctx} wellbeing")
+    elif pred and group:
+        queries.append(" ".join(pred[:3] + group[:2]) + " wellbeing")
+
+    # Q7 : prédicteur + search_context + intervention  (ou groupe si pas de contexte)
+    if pred and search_ctx:
+        queries.append(" ".join(pred[:3]) + f" {search_ctx} intervention")
+    elif pred and group:
+        queries.append(" ".join(pred[:3]) + " intervention " + " ".join(group[:2]))
+
+    # Q8 : prédicteur + search_context  (ou contexte titre si pas de contexte)
+    if pred and search_ctx:
+        queries.append(" ".join(pred[:3]) + f" {search_ctx}")
+    elif pred and ctx:
+        queries.append(" ".join(pred[:3] + ctx[:3]))
+
+    # Q9 : prédicteur + search_context + groupe  (ou tags si pas de contexte)
+    if pred and search_ctx and group:
+        queries.append(" ".join(pred[:2]) + f" {search_ctx} " + " ".join(group[:2]))
+    elif pred and tags:
+        queries.append(" ".join(pred[:3] + tags[:3]))
+
+    # Q10 : combinaison maximale
+    if search_ctx:
+        all_terms = _unique_preserve_order(pred[:2] + search_ctx_terms[:2] + group[:2])
+    else:
+        all_terms = _unique_preserve_order(pred[:2] + ctx[:2] + group[:2] + tags[:2])
+    if all_terms:
+        queries.append(" ".join(all_terms[:9]))
+
+    return _unique_preserve_order([q.strip() for q in queries if q.strip()])[:10]
+
+
+def step2_search_openalex(query, min_citations, email):
+    """Récupère OPENALEX_FETCH articles pour une requête, filtre par citations, retourne top TOP_PER_QUERY."""
     resp = requests.get(
         "https://api.openalex.org/works",
         params={
-            "search": query, "per-page": n, "sort": "relevance_score:desc",
+            "search": query, "per-page": OPENALEX_FETCH, "sort": "relevance_score:desc",
             "select": "title,abstract_inverted_index,doi,publication_year,cited_by_count,open_access,authorships",
             "mailto": email,
         },
         timeout=30
     ).json().get("results", [])
-    return [
+    articles = [
         {
             "title":   w.get("title", ""),
             "abstract":reconstruct_abstract(w.get("abstract_inverted_index")),
@@ -180,6 +288,83 @@ def step2_search_openalex(query, n, min_citations, email):
         }
         for w in resp if w.get("cited_by_count", 0) >= min_citations
     ]
+    # On prend les TOP_PER_QUERY premiers (déjà triés par relevance_score par OpenAlex)
+    return articles[:TOP_PER_QUERY]
+
+
+def step2_search_openalex_multi(queries, min_citations, email):
+    """
+    Lance toutes les requêtes, garde le top TOP_PER_QUERY par requête,
+    déduplique par DOI → pool de ~(nb_requêtes × TOP_PER_QUERY) articles max.
+    """
+    seen = set()
+    pool = []
+    for q in queries:
+        for art in step2_search_openalex(q, min_citations, email):
+            doi = art.get("doi")
+            if doi and doi in seen:
+                continue
+            if doi:
+                seen.add(doi)
+            pool.append(art)
+    return pool
+
+
+def step2_select_articles(pool, pred_name, project, n, api_key):
+    """
+    Le LLM reçoit les titres + début d'abstract du pool entier et sélectionne
+    les N articles les plus pertinents pour le prédicteur dans ce projet.
+    Critères : compatibilité population/contexte projet + lien avec le prédicteur
+    + présence probable d'un effect size quantitatif.
+    Appel unique — tous les candidats en une seule requête, max_tokens minimal.
+    """
+    if not pool:
+        return []
+    if len(pool) <= n:
+        return pool
+
+    candidates = "\n".join(
+        f"{i+1}. [{art.get('cited',0)} citations] {art['title']} ({art.get('year','')})"
+        f" — {(art.get('abstract','') or '')[:180]}"
+        for i, art in enumerate(pool)
+    )
+
+    raw = call_claude(
+        system="You are an expert in social impact evaluation and academic literature. Be strict and concise.",
+        prompt=f"""Project: {project['title']}
+Description: {project.get('description','')[:300]}
+Target group: {project['target_group']}
+Tags: {", ".join(project.get('tags',[]))}
+Predictor studied: {pred_name}
+
+Below are {len(pool)} candidate articles (title + abstract excerpt):
+{candidates}
+
+Select the {n} best articles to keep. Prioritize:
+1. Articles whose population/context matches the project and target group
+2. Articles directly measuring or studying "{pred_name}"
+3. Articles likely to contain a quantitative effect size (meta-analysis, RCT, systematic review)
+
+Return ONLY a JSON list of {n} integers (1-based indices). Example: [3, 7, 12]
+If fewer than {n} articles are suitable, return as many suitable ones as exist.""",
+        max_tokens=60,
+        api_key=api_key
+    )
+
+    try:
+        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        indices = json.loads(match.group()) if match else []
+        selected = [pool[i-1] for i in indices if isinstance(i, int) and 1 <= i <= len(pool)]
+        # Fallback si le LLM retourne moins que demandé
+        if len(selected) < n:
+            doi_selected = {a.get('doi') for a in selected}
+            for art in pool:
+                if len(selected) >= n: break
+                if art.get('doi') not in doi_selected:
+                    selected.append(art)
+        return selected[:n]
+    except Exception:
+        return pool[:n]
 
 
 def step3_extract_effect(article, pred_name, project, api_key):
@@ -197,24 +382,25 @@ Retiens l\'effect size le plus directement lié à {pred_name}.
 
 ```json
 {{
-  "effect_size"     : <float ou null>,
-  "effect_type"     : <"Cohen\'s d"|"Hedge\'s g"|"SMD"|"autre"|null>,
-  "effect_direction": <"positif"|"négatif"|null>,
-  "effect_duration" : <durée pendant laquelle l'effet persiste après l'intervention, ex: "6 months", "1 year", "2 years", "short-term only" — null si non mentionné>,
-  "relevance"       : <1-5>,
-  "confidence"      : <1-5>,
-  "source_text"     : <citation exacte du passage de l'abstract d'où l'effect size a été extrait, ou null si non trouvé>,
-  "note"            : <string court>
+  "effect_size"      : <float ou null>,
+  "effect_type"      : <"Cohen\'s d"|"Hedge\'s g"|"SMD"|"autre"|null>,
+  "effect_direction" : <"positif"|"négatif"|null>,
+  "effect_duration"  : <durée pendant laquelle l'effet persiste après l'intervention, ex: "6 months", "1 year", "2 years", "short-term only" — null si non mentionné>,
+  "relevance"        : <1-5>,
+  "confidence"       : <1-5>,
+  "source_text"      : <citation exacte du passage de l'abstract d'où l'effect size a été extrait, ou null si non trouvé>,
+  "selection_reason" : <1 phrase expliquant pourquoi cet article est pertinent pour le prédicteur "{pred_name}" dans ce projet — ou null si l'article n'est pas pertinent>,
+  "note"             : <string court>
 }}
 ```""",
-        max_tokens=500, api_key=api_key
+        max_tokens=600, api_key=api_key
     )
     try:
         return parse_json(resp)
     except Exception:
         return {"relevance": 1, "confidence": 1, "note": "Erreur d'extraction"}
 
-# SIDEBAR
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## 🧭 Boussole")
@@ -231,6 +417,13 @@ with st.sidebar:
     project_description = st.text_area("Description *", placeholder="Actions concrètes...", height=110)
     target_group        = st.text_input("Groupe cible *", placeholder="Ex: Jeunes 16-25 ans")
     tags_raw            = st.text_input("Tags (optionnel)", placeholder="sport, insertion, ...")
+    search_context      = st.text_input(
+        "🔍 Contexte de recherche (optionnel)",
+        placeholder="Ex : parenting support, workplace stress, sport adolescents",
+        help="2-3 mots en anglais décrivant le domaine spécifique du projet. "
+             "Injectés dans les requêtes OpenAlex pour affiner les résultats. "
+             "Laisser vide pour une recherche générique.",
+    )
 
     st.divider()
     st.markdown("### 🎯 Mode de sélection")
@@ -244,7 +437,8 @@ with st.sidebar:
     st.markdown("### ⚙️ Paramètres")
     if selection_mode == "🤖 Automatique (LLM)":
         top_n = st.slider("Prédicteurs à explorer",  3, 79, 8)
-    articles_per_pred = st.slider("Articles par prédicteur", 1,  20, 3)
+    articles_per_pred = st.slider("Articles par prédicteur", 1, 20, 3,
+                                  help=f"OpenAlex récupère {OPENALEX_FETCH} articles (3 requêtes) → les N meilleurs sont retenus.")
     min_citations     = st.slider("Citations minimum",       0, 30, 3)
 
     st.divider()
@@ -279,17 +473,17 @@ with st.sidebar:
                         st.session_state.active_history_idx = None
                     st.rerun()
 
-# Page principale
+# ── PAGE PRINCIPALE ────────────────────────────────────────────────────────────
 st.markdown("# 🧭 Moteur de recherche d'effect sizes")
 
-# Chargement des prédicteurs (nécessaire pour mode manuel et LLM)
+# Chargement des prédicteurs
 try:
     df_pred, predictors_prompt = load_predictors("articles_dataset.xlsx")
 except FileNotFoundError:
     st.error("❌ `articles_dataset.xlsx` introuvable.")
     st.stop()
 
-# ── Mode Manuel : Sélection des prédicteurs ──────────────────────────────────
+# ── Mode Manuel : Sélection des prédicteurs ────────────────────────────────────
 manual_selected = []
 if selection_mode == "✋ Manuel":
     st.markdown("## 1️⃣ Sélectionnez les prédicteurs à explorer")
@@ -369,10 +563,10 @@ if not run_button and st.session_state.active_history_idx is None and not st.ses
         st.divider()
         st.markdown("""
 **Pipeline en 3 étapes :**
-- **Étape 1** — 2 options : soit Le LLM sélectionne les prédicteurs Margolis les plus pertinents pour le projet / Soit on les séléctionne manuellement
-- **Étape 2** — OpenAlex recherche des articles académiques pour chaque prédicteur
+- **Étape 1** — Le LLM sélectionne les prédicteurs Margolis les plus pertinents / ou sélection manuelle
+- **Étape 2** — 3 requêtes générées par le LLM → OpenAlex récupère jusqu'à 300 articles → les N meilleurs sont retenus
 - **Étape 3** — Le LLM extrait les effect sizes (Cohen's d / Hedge's g) depuis les abstracts
-- **Résultat** -- Exportable au format Excel adapté a Boussole
+- **Résultat** — Exportable au format Excel adapté à Boussole
         """)
     st.stop()
 
@@ -406,10 +600,11 @@ if run_button:
         st.stop()
 
     project = {
-        "title":        project_title,
-        "description":  project_description,
-        "target_group": target_group,
-        "tags":         [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else [],
+        "title":          project_title,
+        "description":    project_description,
+        "target_group":   target_group,
+        "tags":           [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else [],
+        "search_context": search_context.strip() if search_context else "",
     }
     email = openalex_email or "boussole@elements-impact.fr"
 
@@ -425,7 +620,6 @@ if run_button:
             except Exception as e:
                 s1.update(label=f"❌ {e}", state="error"); st.stop()
     else:
-        # Mode manuel : construire la liste de prédicteurs à partir de la sélection utilisateur
         selected_predictors = []
         for pred_name in manual_selected:
             domain = df_pred[df_pred["predictor_en"] == pred_name]["domain_fr"].values
@@ -438,31 +632,52 @@ if run_button:
         st.success(f"✅ {len(selected_predictors)} prédicteur(s) sélectionné(s) manuellement")
 
     # ÉTAPES 2 & 3 : Recherche + Extraction
-    progress = st.progress(0, text="Recherche bibliographique...")
+    progress  = st.progress(0, text="Recherche bibliographique...")
+    seen_dois = set()  # déduplication globale inter-prédicteurs
 
     for i, pred in enumerate(selected_predictors):
         pred_name = pred["predictor_en"]
         progress.progress(i / len(selected_predictors), text=f"🔬 [{i+1}/{len(selected_predictors)}] {pred_name}")
 
         with st.status(f"**[{i+1}/{len(selected_predictors)}] {pred_name}**", expanded=False):
-            # Construction de la requête
-            fallback_query = f"{pred_name} intervention effect size meta-analysis"
-            if selection_mode == "🤖 Automatique (LLM)":
-                try:
-                    query = step2_build_query(pred_name, project, api_key)
-                except Exception as e:
-                    query = fallback_query
-            else:
-                query = fallback_query
-            st.write(f"🔎 `{query}`")
+            # Construction des requêtes — 100% déterministe, modes auto ET manuel
+            queries = step2_build_queries(pred_name, project)
+            if not queries:
+                queries = [f"{pred_name} intervention effect size meta-analysis"]
+
+            for q in queries:
+                st.write(f"🔎 `{q}`")
 
             try:
-                articles = step2_search_openalex(query, articles_per_pred, min_citations, email)
-                # Fallback : si la requête LLM donne 0 résultats, essayer la requête simple
-                if not articles and query != fallback_query:
-                    st.write(f"⚠️ 0 résultats → requête de secours : `{fallback_query}`")
-                    articles = step2_search_openalex(fallback_query, articles_per_pred, min_citations, email)
-                st.write(f"📰 {len(articles)} article(s)")
+                # ── Étape 2a : Recherche multi-requêtes → top TOP_PER_QUERY par requête ──
+                pool = step2_search_openalex_multi(queries, min_citations, email)
+
+                # Fallback si 0 résultats
+                if not pool:
+                    fallback = f"{pred_name} intervention effect size meta-analysis"
+                    st.write(f"⚠️ 0 résultats → requête de secours : `{fallback}`")
+                    pool = step2_search_openalex(fallback, min_citations, email)
+
+                st.write(f"📥 Pool : **{len(pool)} articles** (top {TOP_PER_QUERY}/requête, dédupliqués)")
+
+                # ── Étape 2b : Sélection LLM des meilleurs articles du pool ──────────────
+                st.write(f"🤖 Sélection LLM des {articles_per_pred} meilleurs parmi {len(pool)}...")
+                try:
+                    selected_pool = step2_select_articles(pool, pred_name, project, articles_per_pred, api_key)
+                except Exception as e_sel:
+                    st.write(f"   ⚠️ Sélection LLM échouée ({e_sel}) → fallback citations")
+                    selected_pool = sorted(pool, key=lambda x: x.get("cited", 0), reverse=True)[:articles_per_pred]
+
+                # ── Déduplication DOI inter-prédicteurs ──────────────────────────────────
+                articles = []
+                for art in selected_pool:
+                    doi = art.get("doi")
+                    if doi and doi in seen_dois: continue
+                    if doi: seen_dois.add(doi)
+                    articles.append(art)
+
+                st.write(f"✅ **{len(articles)} article(s) retenus** pour extraction")
+
             except Exception as e:
                 st.warning(f"Erreur OpenAlex : {e}"); continue
 
@@ -479,7 +694,7 @@ if run_button:
                     "domain":           pred["domain_fr"],
                     "pred_score":       pred["relevance_score"],
                     "pred_justif":      pred["justification"],
-                    "query":            query,
+                    "query":            " | ".join(queries),
                     "title":            art["title"],
                     "authors":          art["authors"],
                     "year":             art["year"],
@@ -493,9 +708,10 @@ if run_button:
                     "relevance":        extracted.get("relevance"),
                     "confidence":       extracted.get("confidence"),
                     "source_text":      extracted.get("source_text", ""),
+                    "selection_reason": extracted.get("selection_reason", ""),
                     "note":             extracted.get("note", ""),
                 })
-                time.sleep(0.2)
+                time.sleep(0.05)
 
     progress.progress(1.0, text="✅ Terminé !"); time.sleep(0.5); progress.empty()
 
@@ -508,7 +724,7 @@ if run_button:
     st.session_state.active_history_idx = None
     df = pd.DataFrame(results)
 
-# RÉSULTATS
+# ── RÉSULTATS ──────────────────────────────────────────────────────────────────
 if df.empty:
     st.error("Aucun résultat. Réduisez le filtre de citations.")
     st.stop()
@@ -570,6 +786,22 @@ with tab2:
                 st.markdown(f"**{row['title']}** {doi_link}")
                 st.caption(f"{row['authors']}  ·  {row['year']}  ·  {row['cited']} citations  ·  OA: {row['open_access']}")
                 st.markdown(f'<span class="domain-badge">{row["domain"]}</span> &nbsp; `{row["predictor"]}`', unsafe_allow_html=True)
+                # Justification de sélection
+                if row.get("selection_reason"):
+                    st.markdown(
+                        f'<div style="background:#F0F7F2;border-left:3px solid #4CAF50;padding:6px 10px;'
+                        f'border-radius:4px;margin:4px 0;font-size:0.82rem;color:#2C6E49;">'
+                        f'🎯 <b>Pourquoi cet article</b> : {row["selection_reason"]}</div>',
+                        unsafe_allow_html=True
+                    )
+                # Passage source de l'effect size
+                if row.get("source_text"):
+                    st.markdown(
+                        f'<div style="background:#FFFBEB;border-left:3px solid #F5C518;padding:6px 10px;'
+                        f'border-radius:4px;margin:4px 0;font-size:0.8rem;color:#78580A;font-style:italic;">'
+                        f'📎 &laquo;&nbsp;{row["source_text"]}&nbsp;&raquo;</div>',
+                        unsafe_allow_html=True
+                    )
                 if row.get("note"): st.caption(f"💬 {row['note']}")
             with cr:
                 if pd.notna(row.get("effect_size")):
@@ -584,7 +816,6 @@ with tab2:
 with tab3:
     st.markdown("### Export")
 
-    # Mapping domaines FR → EN (format Boussole)
     DOMAIN_FR_TO_EN = {
         "Environnement socio-politique":      "Socio-political environment",
         "Environnement matériel & éducation": "Material environment and education",
@@ -595,13 +826,6 @@ with tab3:
     }
 
     def make_boussole_df(df_src: pd.DataFrame, project: dict) -> pd.DataFrame:
-        """
-        Format Boussole — toutes les lignes (avec ou sans effect size),
-        triées par prédicteur puis pertinence/confiance décroissante.
-        Colonnes : Project, Project description, Tags, Group, Domain, Predictor,
-                   Effect size, Effect duration, Note (raw), Article links
-
-        """
         df_sorted = df_src.sort_values(
             ["predictor", "relevance", "confidence"],
             ascending=[True, False, False]
@@ -611,33 +835,24 @@ with tab3:
         rows = []
         for _, r in df_sorted.iterrows():
             domain_en = DOMAIN_FR_TO_EN.get(r.get("domain", ""), r.get("domain", ""))
-
-            # ── Note enrichie — passage source de l'effect size ──────────────
             note_parts = []
-
-            # 1. Passage exact d'où l'effect size a été extrait
+            if r.get("selection_reason"):
+                note_parts.append(f"Sélectionné car : {r['selection_reason']}")
             if r.get("source_text"):
                 note_parts.append(f"Extrait : \"{r['source_text']}\"")
-
-            # 2. Note complémentaire du LLM
             if r.get("note"):
                 note_parts.append(r["note"])
-
-            # 3. Source : titre + année + citations
             article_ref = r.get("title", "")
-            if r.get("year"):      article_ref += f" ({r['year']})"
-            if r.get("cited"):     article_ref += f" — {r['cited']} citations"
+            if r.get("year"):  article_ref += f" ({r['year']})"
+            if r.get("cited"): article_ref += f" — {r['cited']} citations"
             if article_ref:
                 note_parts.append(f"Source : {article_ref}")
-
-            # 4. Détails techniques
             details = []
             if r.get("effect_type"):      details.append(f"Type : {r['effect_type']}")
             if r.get("effect_direction"): details.append(f"Direction : {r['effect_direction']}")
             if r.get("confidence"):       details.append(f"Confiance LLM : {r['confidence']}/5")
             if details:
                 note_parts.append(" | ".join(details))
-
             rows.append({
                 "Project":             project.get("title", ""),
                 "Project description": project.get("description", ""),
@@ -652,23 +867,18 @@ with tab3:
             })
         return pd.DataFrame(rows)
 
-    # ── Construction ──────────────────────────────────────────────────────────
     boussole_with    = make_boussole_df(df[df["effect_size"].notna()], project)
     boussole_without = make_boussole_df(df[df["effect_size"].isna()],  project)
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # Onglet 1 : articles avec effect size — prêt à injecter dans Boussole
         boussole_with.to_excel(writer, sheet_name="Boussole — avec effect size", index=False)
-        # Onglet 2 : articles sans effect size — à compléter manuellement
         boussole_without.to_excel(writer, sheet_name="Boussole — sans effect size", index=False)
-        # Onglet 3 : tous les articles avec colonnes techniques complètes
         df.sort_values(["relevance", "confidence"], ascending=False).to_excel(
             writer, sheet_name="Tous les articles", index=False)
-        # Onglet 4 : prédicteurs sélectionnés
         pd.DataFrame(selected_predictors).to_excel(writer, sheet_name="Prédicteurs", index=False)
 
-    proj_name = project_title[:30].replace(" ", "_") if run_button else "historique"
+    proj_name = project.get("title", "export")[:30].replace(" ", "_")
     st.download_button(
         "⬇️ Télécharger Excel (4 onglets)",
         buffer.getvalue(),
@@ -678,7 +888,6 @@ with tab3:
 
     st.divider()
 
-    # ── Aperçu ────────────────────────────────────────────────────────────────
     tab_with, tab_without = st.tabs([
         f"✅ Avec effect size ({len(boussole_with)})",
         f"❌ Sans effect size ({len(boussole_without)})",
